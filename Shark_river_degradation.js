@@ -1,10 +1,9 @@
 Map.centerObject(ROI, 12);
 Map.setOptions('SATELLITE');
-var globFunctions = require('users/calvinkflee/default:calvinFunctions');
 
 // Modelling variables
 var nTrees = 50;
-var treeSplit = 0; // 0 is the default: sqrt of nPredictors
+var treeSplit = 0; // 0 is the default: sqrt of nPredictors 
 var bagFrac = 0.5;
 var minLeaf = 1;
 var seed = 0;
@@ -18,48 +17,74 @@ var GMW2016_image = GMW2016
 GMW2016_image = GMW2016_image.unmask();
 var GMW_mask = ee.Image(1).updateMask(GMW2016_image.neq(1));
 
+// Cloud and shadow masking to null
+function cloudMaskingToNull(image){
+  var cmask = image.select('pixel_qa').bitwiseAnd(32).eq(0);
+  var csmask = image.select('pixel_qa').bitwiseAnd(8).eq(0);
+  var masked = image.updateMask(cmask).updateMask(csmask);
+  return masked;
+}
+
 // Collections
 var L8_2015 = L8_SR
   .filterBounds(ROI)
   .filterDate('2015-06-01', '2016-05-31')
-  .select(['B2','B3','B4','B5','B6','B7','pixel_qa'],
+  .select(['B2','B3','B4','B5','B6','B7','pixel_qa'], 
     ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'pixel_qa'])
-  .map(globFunctions.cloudMaskingToNull);
+  .map(cloudMaskingToNull);
 
-Map.addLayer(L8_2015.reduce(ee.Reducer.median()),
+Map.addLayer(L8_2015.reduce(ee.Reducer.median()), 
   {bands: ['red_median', 'green_median', 'blue_median'],
     min: 100, max: 800}, '2015 RGB median');
+
+// calculate NDVI and add to collection
+function addNDVI(image) {
+  return image.addBands(image.normalizedDifference(['nir', 'red']).rename('NDVI'));
+}
+
+
+// calculate LSWI and add to collection
+function addLSWI(image){
+  return image.addBands(image.normalizedDifference(['nir', 'swir1']).rename('LSWI'));
+}
+
+// NDMI are the same as LSWI (there's also a NDWI (Gao 1996) that's the same).
+
+// Calculate NDWI and add to collection
+function addNDWI(image){
+  return image.addBands(image.normalizedDifference(['green', 'nir']).rename('NDWI'));
+}
 
 
 var L8_pre = L8_SR
   .filterBounds(ROI)
   .filterDate('2016-06-01', '2017-05-31')
-  .select(['B2','B3','B4','B5','B6','B7','pixel_qa'],
+  .select(['B2','B3','B4','B5','B6','B7','pixel_qa'], 
     ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'pixel_qa'])
-  .map(globFunctions.cloudMaskingToNull);
+  .map(cloudMaskingToNull);
 
-Map.addLayer(L8_pre.reduce(ee.Reducer.median()),
+Map.addLayer(L8_pre.reduce(ee.Reducer.median()), 
   {bands: ['red_median', 'green_median', 'blue_median'],
     min: 100, max: 800}, 'pre-Irma RGB median');
 
 var L8_post = L8_SR
   .filterBounds(ROI)
   .filterDate('2017-11-01', '2018-10-31')
-  .select(['B2','B3','B4','B5','B6','B7','pixel_qa'],
+  .select(['B2','B3','B4','B5','B6','B7','pixel_qa'], 
     ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'pixel_qa'])
-  .map(globFunctions.cloudMaskingToNull);
+  .map(cloudMaskingToNull);
 
-Map.addLayer(L8_post.reduce(ee.Reducer.median()),
+Map.addLayer(L8_post.reduce(ee.Reducer.median()), 
   {bands: ['red_median', 'green_median', 'blue_median'],
     min: 100, max: 800}, 'post-Irma RGB median');
 
 
 var L8_post = L8_post
-  .map(globFunctions.cloudMaskingToNull)
-  .map(globFunctions.addNDVI)
-  .map(globFunctions.addNDWI)
-  .map(globFunctions.addLSWI);
-
+  .map(cloudMaskingToNull)
+  .map(addNDVI)
+  .map(addNDWI)
+  .map(addLSWI);
+  
 var post_NDVI = L8_post.select('NDVI');
 var post_NDWI = L8_post.select('NDWI');
 var post_LSWI = L8_post.select('LSWI');
@@ -85,11 +110,11 @@ var covariates_post = avg_NDVI_post
   .updateMask(GMW2016_image)
 
 var L8_pre = L8_pre
-  .map(globFunctions.cloudMaskingToNull)
-  .map(globFunctions.addNDVI)
-  .map(globFunctions.addNDWI)
-  .map(globFunctions.addLSWI);
-
+  .map(cloudMaskingToNull)
+  .map(addNDVI)
+  .map(addNDWI)
+  .map(addLSWI);
+  
 var pre_NDVI = L8_pre.select('NDVI');
 var pre_NDWI = L8_pre.select('NDWI');
 var pre_LSWI = L8_pre.select('LSWI');
@@ -145,7 +170,7 @@ var RFmodel = ee.Classifier.smileRandomForest(nTrees);
 var trainedClassifier = RFmodel.train({
   features: training_sample,
   classProperty: 'class',
-  inputProperties: ['NDVI_mean',
+  inputProperties: ['NDVI_mean', 
   'NDVI_stdDev',
   'LSWI_mean',
   'LSWI_stdDev',
@@ -171,11 +196,14 @@ print(chart);
 
 
 // Classify the two pre- and post- images
+var plasma = ["0d0887", "3d049b", "6903a5", "8d0fa1", "ae2891", 
+  "cb4679", "df6363", "f0844c", "faa638", "fbcc27", "f0f921"];
+
 var output_pre = covariates_pre.classify(trainedClassifier);
-Map.addLayer(output_pre, {palette: globFunctions.plasma, min: 0, max: 1},
+Map.addLayer(output_pre, {palette: plasma, min: 0, max: 1},
   'pre_Irma degradation probability');
 var output_post = covariates_post.classify(trainedClassifier);
-Map.addLayer(output_post, {palette: globFunctions.plasma, min: 0, max: 1},
+Map.addLayer(output_post, {palette: plasma, min: 0, max: 1},
   'post-Irma degradation');
 
 // Exporting classifications
@@ -198,3 +226,4 @@ Export.image.toDrive({
   region: ROI,
   crs: 'EPSG:32617'
 });
+
