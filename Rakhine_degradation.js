@@ -4,7 +4,6 @@ site = rakhineMangroves;
 
 Map.centerObject(site);
 
-var globFunctions = require('users/calvinkflee/default:calvinFunctions');
 var outFolder = 'Rakhine';
 var nTrees = 50;
 
@@ -30,33 +29,57 @@ var createTimeBand = function(image) {
   return image.addBands(image.metadata('system:time_start').divide(3e11));
 };
 
+// Cloud and shadow masking to null
+function cloudMaskingToNull(image){
+  var cmask = image.select('pixel_qa').bitwiseAnd(32).eq(0);
+  var csmask = image.select('pixel_qa').bitwiseAnd(8).eq(0);
+  var masked = image.updateMask(cmask).updateMask(csmask);
+  return masked;
+}
+
+// calculate NDVI and add to collection
+function addNDVI(image) {
+  return image.addBands(image.normalizedDifference(['nir', 'red']).rename('NDVI'));
+}
+
+
+// calculate LSWI and add to collection
+function addLSWI(image){
+  return image.addBands(image.normalizedDifference(['nir', 'swir1']).rename('LSWI'));
+}
+
+// NDMI are the same as LSWI (there's also a NDWI (Gao 1996) that's the same).
+
+// Calculate NDWI and add to collection
+function addNDWI(image){
+  return image.addBands(image.normalizedDifference(['green', 'nir']).rename('NDWI'));
+}
 
 var L8_2016 = L8_SR
   .filterBounds(site)
   .filterDate('2016-01-01', '2016-12-31')
-  .select(['B2','B3','B4','B5','B6','B7','pixel_qa'],
+  .select(['B2','B3','B4','B5','B6','B7','pixel_qa'], 
     ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'pixel_qa']);
 
-Map.addLayer(L8_2016.reduce(ee.Reducer.median()),
+Map.addLayer(L8_2016.reduce(ee.Reducer.median()), 
   {bands: ['red_median', 'green_median', 'blue_median'],
     min: 0, max: 2500}, '2016 RGB median');
 
 var L8_col = L8_SR
   .filterBounds(site)
   .filterDate('2017-01-01', '2017-12-31')
-  .select(['B2','B3','B4','B5','B6','B7','pixel_qa'],
+  .select(['B2','B3','B4','B5','B6','B7','pixel_qa'], 
     ['blue', 'green', 'red', 'nir', 'swir1', 'swir2', 'pixel_qa']);
+    
 
 L8_col = L8_col
-  .map(globFunctions.cloudMaskingToNull)
-  .map(globFunctions.addNDVI)
-  .map(globFunctions.addNDWI)
-  .map(globFunctions.addSVVI)
-  .map(globFunctions.addLSWI);
-
+  .map(cloudMaskingToNull)
+  .map(addNDVI)
+  .map(addNDWI)
+  .map(addLSWI);
+  
 var L8_NDVI = L8_col.select('NDVI');
 var L8_NDWI = L8_col.select('NDWI');
-var L8_SVVI = L8_col.select('SVVI');
 var L8_LSWI = L8_col.select('LSWI');
 
 var avg_NDVI = L8_NDVI.reduce(ee.Reducer.mean());
@@ -66,27 +89,129 @@ var sd_NDWI = L8_NDWI.reduce(ee.Reducer.stdDev());
 var avg_LSWI = L8_LSWI.reduce(ee.Reducer.mean());
 var sd_LSWI = L8_LSWI.reduce(ee.Reducer.stdDev());
 
-var max_SVVI = L8_SVVI.reduce(ee.Reducer.max());
-
 var NDVI_25p = L8_NDVI.reduce(ee.Reducer.percentile([25]));
 var NDVI_75p = L8_NDVI.reduce(ee.Reducer.percentile([75]));
 var NDVI_IQR = NDVI_75p.subtract(NDVI_25p);
 
 
 // ALOS PALSAR
+function PALSARConversion(image){
+  return image.pow(2).log10().multiply(ee.Image(10)).subtract(ee.Image(83.0));
+}
+
+function refinedLee(img) {
+  // img must be in natural units, i.e. not in dB!
+  // Set up 3x3 kernels 
+
+  // convert to natural.. do not apply function on dB!
+  var myimg = toNatural(img);
+
+  var weights3 = ee.List.repeat(ee.List.repeat(1,3),3);
+  var kernel3 = ee.Kernel.fixed(3,3, weights3, 1, 1, false);
+
+  var mean3 = myimg.reduceNeighborhood(ee.Reducer.mean(), kernel3);
+  var variance3 = myimg.reduceNeighborhood(ee.Reducer.variance(), kernel3);
+
+  // Use a sample of the 3x3 windows inside a 7x7 windows to determine gradients and directions
+  var sample_weights = ee.List([[0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0], [0,1,0,1,0,1,0], [0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0]]);
+
+  var sample_kernel = ee.Kernel.fixed(7,7, sample_weights, 3,3, false);
+
+  // Calculate mean and variance for the sampled windows and store as 9 bands
+  var sample_mean = mean3.neighborhoodToBands(sample_kernel); 
+  var sample_var = variance3.neighborhoodToBands(sample_kernel);
+
+  // Determine the 4 gradients for the sampled windows
+  var gradients = sample_mean.select(1).subtract(sample_mean.select(7)).abs();
+  gradients = gradients.addBands(sample_mean.select(6).subtract(sample_mean.select(2)).abs());
+  gradients = gradients.addBands(sample_mean.select(3).subtract(sample_mean.select(5)).abs());
+  gradients = gradients.addBands(sample_mean.select(0).subtract(sample_mean.select(8)).abs());
+
+  // And find the maximum gradient amongst gradient bands
+  var max_gradient = gradients.reduce(ee.Reducer.max());
+
+  // Create a mask for band pixels that are the maximum gradient
+  var gradmask = gradients.eq(max_gradient);
+
+  // duplicate gradmask bands: each gradient represents 2 directions
+  gradmask = gradmask.addBands(gradmask);
+
+  // Determine the 8 directions
+  var directions = sample_mean.select(1).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(7))).multiply(1);
+  directions = directions.addBands(sample_mean.select(6).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(2))).multiply(2));
+  directions = directions.addBands(sample_mean.select(3).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(5))).multiply(3));
+  directions = directions.addBands(sample_mean.select(0).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(8))).multiply(4));
+  // The next 4 are the not() of the previous 4
+  directions = directions.addBands(directions.select(0).not().multiply(5));
+  directions = directions.addBands(directions.select(1).not().multiply(6));
+  directions = directions.addBands(directions.select(2).not().multiply(7));
+  directions = directions.addBands(directions.select(3).not().multiply(8));
+
+  // Mask all values that are not 1-8
+  directions = directions.updateMask(gradmask);
+
+  // "collapse" the stack into a singe band image (due to masking, each pixel has just one value (1-8) in it's directional band, and is otherwise masked)
+  directions = directions.reduce(ee.Reducer.sum());  
+
+  var sample_stats = sample_var.divide(sample_mean.multiply(sample_mean));
+
+  // Calculate localNoiseVariance
+  var sigmaV = sample_stats.toArray().arraySort().arraySlice(0,0,5).arrayReduce(ee.Reducer.mean(), [0]);
+
+  // Set up the 7*7 kernels for directional statistics
+  var rect_weights = ee.List.repeat(ee.List.repeat(0,7),3).cat(ee.List.repeat(ee.List.repeat(1,7),4));
+
+  var diag_weights = ee.List([[1,0,0,0,0,0,0], [1,1,0,0,0,0,0], [1,1,1,0,0,0,0], 
+    [1,1,1,1,0,0,0], [1,1,1,1,1,0,0], [1,1,1,1,1,1,0], [1,1,1,1,1,1,1]]);
+
+  var rect_kernel = ee.Kernel.fixed(7,7, rect_weights, 3, 3, false);
+  var diag_kernel = ee.Kernel.fixed(7,7, diag_weights, 3, 3, false);
+
+  // Create stacks for mean and variance using the original kernels. Mask with relevant direction.
+  var dir_mean = myimg.reduceNeighborhood(ee.Reducer.mean(), rect_kernel).updateMask(directions.eq(1));
+  var dir_var = myimg.reduceNeighborhood(ee.Reducer.variance(), rect_kernel).updateMask(directions.eq(1));
+
+  dir_mean = dir_mean.addBands(myimg.reduceNeighborhood(ee.Reducer.mean(), diag_kernel).updateMask(directions.eq(2)));
+  dir_var = dir_var.addBands(myimg.reduceNeighborhood(ee.Reducer.variance(), diag_kernel).updateMask(directions.eq(2)));
+
+  // and add the bands for rotated kernels
+  for (var i=1; i<4; i++) {
+    dir_mean = dir_mean.addBands(myimg.reduceNeighborhood(ee.Reducer.mean(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+    dir_var = dir_var.addBands(myimg.reduceNeighborhood(ee.Reducer.variance(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+    dir_mean = dir_mean.addBands(myimg.reduceNeighborhood(ee.Reducer.mean(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+    dir_var = dir_var.addBands(myimg.reduceNeighborhood(ee.Reducer.variance(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+  }
+
+  // "collapse" the stack into a single band image (due to masking, each pixel has just one value in it's directional band, and is otherwise masked)
+  dir_mean = dir_mean.reduce(ee.Reducer.sum());
+  dir_var = dir_var.reduce(ee.Reducer.sum());
+
+  // A finally generate the filtered value
+  var varX = dir_var.subtract(dir_mean.multiply(dir_mean).multiply(sigmaV)).divide(sigmaV.add(1.0));
+
+  var b = varX.divide(dir_var);
+
+  var result = dir_mean.add(b.multiply(myimg.subtract(dir_mean)));
+  // return(result);
+  return(ee.Image(toDB(result.arrayGet(0))).rename("filter"));
+ 
+}
+
+
+
 var PALSAR_2017 = PALSAR
   .filterDate('2017-01-01', '2017-12-31');
-
-var PALSAR_2017_HH = globFunctions.PALSARConversion(PALSAR_2017.select('HH').first());
-var PALSAR_2017_HV = globFunctions.PALSARConversion(PALSAR_2017.select('HV').first());
+  
+var PALSAR_2017_HH = PALSARConversion(PALSAR_2017.select('HH').first());
+var PALSAR_2017_HV = PALSARConversion(PALSAR_2017.select('HV').first());
 var PALSAR_2017_ratio = PALSAR_2017_HH.divide(PALSAR_2017_HV);
 
 var PALSAR_2017_RGB = PALSAR_2017_HH
   .addBands(PALSAR_2017_HV)
   .addBands(PALSAR_2017_ratio);
 
-var PALSAR_2017_HH_filtered = globFunctions.refinedLee(PALSAR_2017_HH).rename('HH');
-var PALSAR_2017_HV_filtered = globFunctions.refinedLee(PALSAR_2017_HV).rename('HV');
+var PALSAR_2017_HH_filtered = refinedLee(PALSAR_2017_HH).rename('HH');
+var PALSAR_2017_HV_filtered = refinedLee(PALSAR_2017_HV).rename('HV');
 
 
 // Masking out non-mangrove areas according to GMW2016
@@ -136,7 +261,7 @@ var RFmodel = ee.Classifier.smileRandomForest(nTrees);
 var intact_trainedClassifier = RFmodel.train({
   features: intact_trainingPartition,
   classProperty: 'class',
-  inputProperties: ['NDVI_mean',
+  inputProperties: ['NDVI_mean', 
   'HH',
   'HV',
   'NDVI_stdDev',
@@ -176,8 +301,10 @@ print('Validation overall accuracy for intact model: ', intact_confusionMatrix.a
 // Classify the whole image
 var intact_output = covariates.classify(intact_trainedClassifier);
 
-Map.addLayer(intact_output, {palette: globFunctions.plasma, min: 0, max: 1},
-  'Intact mangrove map');
+var plasma = ["0d0887", "3d049b", "6903a5", "8d0fa1", "ae2891", 
+  "cb4679", "df6363", "f0844c", "faa638", "fbcc27", "f0f921"];
+
+Map.addLayer(intact_output, {palette: plasma, min: 0, max: 1}, 'Intact mangrove map');
 
 
 
@@ -213,7 +340,7 @@ var RFmodel = ee.Classifier.smileRandomForest(nTrees);
 var collapsed_trainedClassifier = RFmodel.train({
   features: collapsed_trainingPartition,
   classProperty: 'class',
-  inputProperties: ['NDVI_mean',
+  inputProperties: ['NDVI_mean', 
   'HH',
   'HV',
   'NDVI_stdDev',
@@ -253,15 +380,15 @@ print('Validation overall accuracy for collapsed model: ', collapsed_confusionMa
 // Classify the whole image
 var collapsed_output = covariates.classify(collapsed_trainedClassifier);
 
-Map.addLayer(collapsed_output, {palette: globFunctions.plasma, min: 0, max: 1},
+Map.addLayer(collapsed_output, {palette: plasma, min: 0, max: 1},
   'collapsed mangrove map');
 
 // Combining the two classifications
 var three_class = intact_output.add(collapsed_output);
 
-Map.addLayer(three_class, {palette: globFunctions.plasma, min: 0, max: 2},
+Map.addLayer(three_class, {palette: plasma, min: 0, max: 2},
   'three class mangrove map');
-
+  
 Export.image.toDrive({
   image: intact_output,
   description: 'exportIntact',
